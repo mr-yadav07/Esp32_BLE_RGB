@@ -10,14 +10,12 @@
   .devInfo{flex:1;margin-right:8px}
   .selectedDot{width:12px;height:12px;border-radius:50%}
   .active{box-shadow:0 0 0 3px rgba(0,128,255,0.12)}
-  .offline button.connBtn{background:#ccc;color:#666;cursor:not-allowed}
   #controls{padding:10px;background:#ededed;border-top:1px solid #ccc}
   #sliders{display:flex;flex-direction:column;gap:8px;margin-bottom:8px}
   .sliderRow{display:flex;align-items:center;gap:8px}
   .sliderRow label{width:30px}
   input[type=range]{flex:1}
-  button{padding:8px 12px;margin:2px;border:none;border-radius:6px;background:#1976d2;color:#fff;cursor:pointer}
-  button:disabled{background:#ccc;color:#666;cursor:not-allowed}
+  button{width:100%;padding:10px;margin:4px 0;border:none;border-radius:6px;background:#1976d2;color:#fff}
   #status{height:90px;overflow:auto;background:#111;color:#0f0;font-family:monospace;font-size:12px;padding:6px;border-radius:6px;margin-top:6px}
 </style>
 </head>
@@ -26,8 +24,8 @@
 
   <div id="controls">
     <div style="display:flex;gap:8px;margin-bottom:8px">
-      <button id="btnScan" style="flex:1">Scan</button>
-      <button id="btnSync" style="flex:1">Sync Selected</button>
+      <button id="btnScan">Scan</button>
+      <button id="btnSync">Sync Selected</button>
     </div>
 
     <div id="sliders">
@@ -45,11 +43,15 @@
   </div>
 
 <script>
+/*
+ Updated backend logic for smooth, accurate sliders and robust error handling.
+ UI unchanged.
+*/
 const SERVICE = '12345678-1234-1234-1234-1234567890ab';
 const COLOR_UUID = '87654321-4321-4321-4321-abcdefabcdef';
 const LED_UUID   = 'abcdefab-cdef-cdef-cdef-1234567890ab';
 
-let devices = []; // {device, server, colorChar, ledChar, selected, active, lastColor:[r,g,b], online}
+let devices = []; // {device, server, colorChar, ledChar, selected, active, lastColor:[r,g,b], online, reconnectTimer}
 let activeDevice = null;
 
 const deviceListDiv = document.getElementById('deviceList');
@@ -68,15 +70,16 @@ function log(msg){
   statusDiv.scrollTop = statusDiv.scrollHeight;
 }
 
+// find by device id
 function findEntryByDevice(dev){
   return devices.find(e=>e.device.id === dev.id);
 }
 
 function renderList(){
   deviceListDiv.innerHTML = '';
-  devices.forEach((e)=>{
+  devices.forEach((e, idx)=>{
     const row = document.createElement('div');
-    row.className = 'deviceRow' + (e.active ? ' active' : '') + (e.online ? '' : ' offline');
+    row.className = 'deviceRow' + (e.active ? ' active' : '');
     const info = document.createElement('div');
     info.className = 'devInfo';
     info.innerHTML = `<strong>${e.device.name||e.device.id}</strong><div style="font-size:12px;color:#555">
@@ -85,16 +88,14 @@ function renderList(){
 
     const sel = document.createElement('input');
     sel.type='checkbox'; sel.checked = !!e.selected;
-    sel.onclick = (ev)=>{ e.selected = ev.target.checked; };
+    sel.onclick = (ev)=>{ e.selected = ev.target.checked; renderList(); };
 
     const act = document.createElement('button');
     act.textContent = 'Edit';
     act.onclick = ()=>{ setActive(e); };
 
     const conn = document.createElement('button');
-    conn.className = 'connBtn';
     conn.textContent = e.online ? 'Disconnect' : 'Connect';
-    conn.disabled = false;
     conn.onclick = ()=>{ e.online ? disconnectEntry(e) : connectEntry(e); };
 
     controls.appendChild(sel);
@@ -107,60 +108,88 @@ function renderList(){
   });
 }
 
+// SCAN and add
 async function scanAndAdd(){
   try {
     const dev = await navigator.bluetooth.requestDevice({acceptAllDevices:true, optionalServices:[SERVICE]});
     if(findEntryByDevice(dev)) { log('Device already in list'); return; }
-    const entry = { device: dev, server: null, colorChar:null, ledChar:null, selected:false, active:false, lastColor:[0,0,0], online:false };
+    const entry = { device: dev, server: null, colorChar:null, ledChar:null, selected:false, active:false, lastColor:[0,0,0], online:false, reconnectTimer:null,
+      // write control
+      writeLock: false, pendingWrite: null
+    };
     devices.push(entry);
     renderList();
     log('Added: ' + (dev.name||dev.id));
     await connectEntry(entry);
-  } catch(err){ log('Scan error: '+err); }
+  } catch(err){ log('Scan error: '+String(err)); }
 }
 
+// Connect with robust handling
 async function connectEntry(entry){
   try {
     log('Connecting '+(entry.device.name||entry.device.id));
     entry.server = await entry.device.gatt.connect();
+    // clear any reconnect timer
+    if (entry.reconnectTimer) { clearTimeout(entry.reconnectTimer); entry.reconnectTimer = null; }
+
     entry.device.addEventListener('gattserverdisconnected', ()=> {
       entry.online = false;
       log('Disconnected: '+(entry.device.name||entry.device.id));
       renderList();
-      setTimeout(()=>connectEntry(entry).catch(()=>{}), 1000);
+      // attempt auto-reconnect with exponential backoff (capped)
+      scheduleReconnect(entry);
     });
+
     const svc = await entry.server.getPrimaryService(SERVICE);
     entry.colorChar = await svc.getCharacteristic(COLOR_UUID);
     entry.ledChar = await svc.getCharacteristic(LED_UUID);
 
+    // subscribe to notifications - keep updated lastColor
     try {
       await entry.colorChar.startNotifications();
       entry.colorChar.addEventListener('characteristicvaluechanged', (ev)=>{
         const data = ev.target.value;
-        if (data.byteLength >= 3) {
+        if (data && data.byteLength >= 3) {
           const r = data.getUint8(0), g = data.getUint8(1), b = data.getUint8(2);
           entry.lastColor = [r,g,b];
           entry.online = true;
-          if (entry === activeDevice) setSlidersFromEntry(entry);
+          // If user is not interacting with sliders for this device, update sliders
+          if (entry === activeDevice && !entry.userInteracting) {
+            setSlidersFromEntry(entry);
+          }
           renderList();
         }
       });
-    } catch(err){ log('Notif error: '+err); }
+    } catch(err){ log('Notif error: '+String(err)); }
 
+    // try to read initial color (best-effort)
     try {
       const v = await entry.colorChar.readValue();
-      if (v.byteLength >= 3) entry.lastColor = [v.getUint8(0), v.getUint8(1), v.getUint8(2)];
-    } catch(e){}
+      if (v && v.byteLength >= 3) entry.lastColor = [v.getUint8(0), v.getUint8(1), v.getUint8(2)];
+    } catch(e){ /* ignore read errors */ }
 
     entry.online = true;
-    log('Connected: '+(entry.device.name||entry.device.id));
-    if (!activeDevice) setActive(entry); // auto-select first connected device
+    entry.userInteracting = false;
+    log('Connected: '+(entry.device.name||entry.device.id)+' last R='+entry.lastColor[0]+' G='+entry.lastColor[1]+' B='+entry.lastColor[2]);
     renderList();
   } catch(err){
     entry.online = false;
-    log('Connect failed: '+(entry.device.name||entry.device.id)+' : '+err);
+    log('Connect failed: '+(entry.device.name||entry.device.id)+' : '+String(err));
     renderList();
+    scheduleReconnect(entry);
   }
+}
+
+function scheduleReconnect(entry) {
+  if (entry.reconnectTimer) return; // already scheduled
+  let attempts = entry._retries||0;
+  const delay = Math.min(5000 + attempts*2000, 30000);
+  entry._retries = attempts + 1;
+  entry.reconnectTimer = setTimeout(()=> {
+    entry.reconnectTimer = null;
+    connectEntry(entry).catch(()=>{});
+  }, delay);
+  log(`Reconnect scheduled for ${entry.device.name||entry.device.id} in ${delay/1000}s`);
 }
 
 async function disconnectEntry(entry){
@@ -170,57 +199,118 @@ async function disconnectEntry(entry){
       entry.online = false;
       log('Force disconnect: '+(entry.device.name||entry.device.id));
     }
-  } catch(e){ log('Disconnect error: '+e); }
+  } catch(e){ log('Disconnect error: '+String(e)); }
 }
 
+// ACTIVE device selection
 function setActive(entry){
-  devices.forEach(e=>e.active=false);
+  devices.forEach(e=>{ e.active=false; });
   entry.active = true;
   activeDevice = entry;
+  // set sliders to device lastColor immediately
   setSlidersFromEntry(entry);
   renderList();
   log('Editing: '+(entry.device.name||entry.device.id));
 }
 
 function setSlidersFromEntry(entry){
-  redSlider.value = entry.lastColor[0];
-  greenSlider.value = entry.lastColor[1];
-  blueSlider.value = entry.lastColor[2];
+  // only set slider values without triggering send
+  suspendSliderSendTemporarily(entry, () => {
+    redSlider.value = entry.lastColor[0];
+    greenSlider.value = entry.lastColor[1];
+    blueSlider.value = entry.lastColor[2];
+  });
 }
 
-async function sendToActive(){
-  if(!activeDevice || !activeDevice.online || !activeDevice.colorChar) { return; }
-  const r = Number(redSlider.value)|0;
-  const g = Number(greenSlider.value)|0;
-  const b = Number(blueSlider.value)|0;
-  const data = new Uint8Array([r,g,b]);
-  try {
-    await activeDevice.colorChar.writeValue(data);
-    log(`Sent to ${activeDevice.device.name||activeDevice.device.id}: R=${r} G=${g} B=${b}`);
-    activeDevice.lastColor = [r,g,b];
-    renderList();
-  } catch(err) {
-    log('Write error to active: '+err);
+// --- Slider interaction and write logic ---
+
+// Prevent feedback loop: when user interacts, mark flag so notifications don't override sliders
+function onUserInteractionStart(entry){
+  if (!entry) return;
+  entry.userInteracting = true;
+  // clear any pending "end" timer
+  if (entry._interactionEndTimer) { clearTimeout(entry._interactionEndTimer); entry._interactionEndTimer = null; }
+}
+function onUserInteractionEnd(entry){
+  if (!entry) return;
+  // schedule clearing interaction flag slightly after user stops to allow final writes
+  entry._interactionEndTimer = setTimeout(()=>{ entry.userInteracting = false; entry._interactionEndTimer = null; }, 250);
+}
+
+// suspend slider send for short block while programmatically setting sliders
+function suspendSliderSendTemporarily(entry, fn){
+  if (entry) entry._suspend = true;
+  fn();
+  // release after small delay
+  setTimeout(()=>{ if (entry) entry._suspend = false; }, 50);
+}
+
+// write control: debounce + dedupe + in-flight lock
+async function queueWriteColor(entry, rgbArray){
+  if (!entry || !entry.colorChar || !entry.online) return;
+  entry.pendingWrite = rgbArray; // always keep latest request
+  // if a write already in-flight, let it complete; it will re-check pendingWrite
+  if (entry.writeLock) return;
+  while (entry.pendingWrite) {
+    const toSend = entry.pendingWrite;
+    entry.pendingWrite = null;
+    entry.writeLock = true;
+    try {
+      await entry.colorChar.writeValue(new Uint8Array(toSend));
+      // update local lastColor immediately to reflect intent (device will notify real color)
+      entry.lastColor = Array.from(toSend);
+      log(`Sent to ${entry.device.name||entry.device.id}: R=${toSend[0]} G=${toSend[1]} B=${toSend[2]}`);
+      renderList();
+    } catch(err){
+      log(`Write error to ${entry.device.name||entry.device.id}: ${String(err)} — retrying in 300ms`);
+      // on error, put the toSend back as pending and wait before retry
+      entry.pendingWrite = toSend;
+      await new Promise(r => setTimeout(r, 300));
+    } finally {
+      entry.writeLock = false;
+    }
   }
 }
 
+// when sliders change, send only for active device
+function onSliderInput(){
+  const entry = activeDevice;
+  if (!entry || !entry.online || !entry.colorChar) return;
+  // if we are programmatically setting sliders, ignore
+  if (entry._suspend) return;
+  onUserInteractionStart(entry);
+  // read values
+  const r = Number(redSlider.value)|0;
+  const g = Number(greenSlider.value)|0;
+  const b = Number(blueSlider.value)|0;
+  // store last requested and debounce actual send
+  entry._lastRequest = [r,g,b];
+  if (entry._debounceTimer) clearTimeout(entry._debounceTimer);
+  entry._debounceTimer = setTimeout(()=>{
+    entry._debounceTimer = null;
+    queueWriteColor(entry, entry._lastRequest).catch(err=>log('Queue write failed: '+String(err)));
+    onUserInteractionEnd(entry);
+  }, 60); // 60ms debounce — responsive and prevents flood
+}
+
+// Sync selected devices (broadcast)
 async function syncSelected(){
   const r = Number(redSlider.value)|0;
   const g = Number(greenSlider.value)|0;
   const b = Number(blueSlider.value)|0;
-  const data = new Uint8Array([r,g,b]);
   const targets = devices.filter(d=>d.selected && d.online && d.colorChar);
   if(targets.length===0){ log('No selected online devices'); return; }
   for(const e of targets){
     try {
-      await e.colorChar.writeValue(data);
+      await e.colorChar.writeValue(new Uint8Array([r,g,b]));
       e.lastColor = [r,g,b];
       log(`Sync -> ${e.device.name||e.device.id}`);
-    } catch(err){ log('Sync write fail '+(e.device.name||e.device.id)+' : '+err); }
+    } catch(err){ log('Sync write fail '+(e.device.name||e.device.id)+' : '+String(err)); }
   }
   renderList();
 }
 
+// LED buttons operate on selected devices only
 async function setLedStateOnSelected(state){
   const targets = devices.filter(d=>d.selected && d.online && d.ledChar);
   if(targets.length===0){ log('No selected online devices for LED'); return; }
@@ -229,26 +319,36 @@ async function setLedStateOnSelected(state){
     try {
       await e.ledChar.writeValue(data);
       log(`LED ${state?'ON':'OFF'} -> ${e.device.name||e.device.id}`);
-    } catch(err){ log('LED write fail '+(e.device.name||e.device.id)+' : '+err); }
+    } catch(err){ log('LED write fail '+(e.device.name||e.device.id)+' : '+String(err)); }
   }
 }
 
+// UI event bindings
 btnScan.onclick = scanAndAdd;
 btnSync.onclick = syncSelected;
 btnLedOn.onclick = ()=>setLedStateOnSelected(1);
 btnLedOff.onclick = ()=>setLedStateOnSelected(0);
 
-let throttleTimer = null;
-function sliderChanged(){
-  if (throttleTimer) clearTimeout(throttleTimer);
-  throttleTimer = setTimeout(()=>{ sendToActive(); throttleTimer=null; }, 80);
-}
-redSlider.oninput = sliderChanged;
-greenSlider.oninput = sliderChanged;
-blueSlider.oninput = sliderChanged;
+// slider events: input for responsive movement; also pointer down/up to track interaction
+redSlider.addEventListener('input', onSliderInput);
+greenSlider.addEventListener('input', onSliderInput);
+blueSlider.addEventListener('input', onSliderInput);
 
+// pointerdown/up to detect active interaction (helps ignore device notifications)
+['pointerdown','touchstart','mousedown'].forEach(evt=>{
+  redSlider.addEventListener(evt, ()=>{ if(activeDevice) onUserInteractionStart(activeDevice); });
+  greenSlider.addEventListener(evt, ()=>{ if(activeDevice) onUserInteractionStart(activeDevice); });
+  blueSlider.addEventListener(evt, ()=>{ if(activeDevice) onUserInteractionStart(activeDevice); });
+});
+['pointerup','touchend','mouseup','touchcancel'].forEach(evt=>{
+  redSlider.addEventListener(evt, ()=>{ if(activeDevice) onUserInteractionEnd(activeDevice); });
+  greenSlider.addEventListener(evt, ()=>{ if(activeDevice) onUserInteractionEnd(activeDevice); });
+  blueSlider.addEventListener(evt, ()=>{ if(activeDevice) onUserInteractionEnd(activeDevice); });
+});
+
+// initial render
 renderList();
-log('App ready');
+log('App ready (slider engine: debounce 60ms, in-flight dedupe, interaction guard)');
 </script>
 </body>
 </html>

@@ -15,6 +15,7 @@
   .sliderRow label{width:30px}
   input[type=range]{flex:1}
   button{width:100%;padding:10px;margin:4px 0;border:none;border-radius:6px;background:#1976d2;color:#fff}
+  .smallBtn{padding:6px;font-size:12px}
   #status{height:90px;overflow:auto;background:#111;color:#0f0;font-family:monospace;font-size:12px;padding:6px;border-radius:6px;margin-top:6px}
 </style>
 </head>
@@ -27,10 +28,29 @@
       <button id="btnSync">Sync OFF</button>
     </div>
 
+    <div style="display:flex;gap:8px;margin-bottom:4px">
+      <button id="btnSelectAll" class="smallBtn">Select All Online</button>
+      <button id="btnClearSel" class="smallBtn">Clear Selection</button>
+    </div>
+
     <div id="sliders">
       <div class="sliderRow"><label>R</label><input id="redSlider" type="range" min="0" max="255"></div>
       <div class="sliderRow"><label>G</label><input id="greenSlider" type="range" min="0" max="255"></div>
       <div class="sliderRow"><label>B</label><input id="blueSlider" type="range" min="0" max="255"></div>
+    </div>
+
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px">
+      <button id="presetRed"   class="smallBtn" style="flex:1;background:#b71c1c">Red</button>
+      <button id="presetGreen" class="smallBtn" style="flex:1;background:#1b5e20">Green</button>
+      <button id="presetBlue"  class="smallBtn" style="flex:1;background:#0d47a1">Blue</button>
+      <button id="presetWhite" class="smallBtn" style="flex:1;background:#9e9e9e">White</button>
+      <button id="presetWarm"  class="smallBtn" style="flex:1;background:#ff8f00">Warm</button>
+      <button id="presetOff"   class="smallBtn" style="flex:1;background:#424242">Off</button>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-bottom:6px">
+      <button id="btnAnimBreath" class="smallBtn" style="flex:1;background:#6a1b9a">Breath</button>
+      <button id="btnAnimStop"   class="smallBtn" style="flex:1;background:#455a64">Stop Anim</button>
     </div>
 
     <div style="display:flex;gap:8px">
@@ -46,19 +66,38 @@ const SERVICE = '12345678-1234-1234-1234-1234567890ab';
 const COLOR_UUID = '87654321-4321-4321-4321-abcdefabcdef';
 const LED_UUID   = 'abcdefab-cdef-cdef-cdef-1234567890ab';
 
-let devices = [];
+let devices = []; // {device, server, colorChar, ledChar, selected, active, lastColor, online, reconnecting}
 let activeDevice = null;
-let syncMode = false;   // NEW: sync toggle
+let syncMode = false;
 
 const deviceListDiv = document.getElementById('deviceList');
 const statusDiv = document.getElementById('status');
 const btnScan = document.getElementById('btnScan');
 const btnSync = document.getElementById('btnSync');
+const btnSelectAll = document.getElementById('btnSelectAll');
+const btnClearSel = document.getElementById('btnClearSel');
 const redSlider = document.getElementById('redSlider');
 const greenSlider = document.getElementById('greenSlider');
 const blueSlider = document.getElementById('blueSlider');
 const btnLedOn = document.getElementById('btnLedOn');
 const btnLedOff = document.getElementById('btnLedOff');
+
+const btnPresetRed   = document.getElementById('presetRed');
+const btnPresetGreen = document.getElementById('presetGreen');
+const btnPresetBlue  = document.getElementById('presetBlue');
+const btnPresetWhite = document.getElementById('presetWhite');
+const btnPresetWarm  = document.getElementById('presetWarm');
+const btnPresetOff   = document.getElementById('presetOff');
+
+const btnAnimBreath = document.getElementById('btnAnimBreath');
+const btnAnimStop   = document.getElementById('btnAnimStop');
+
+let throttleTimer = null;
+
+// animation state
+let animTimer = null;
+let animMode = null;
+let animPhase = 0;
 
 function log(msg){
   const t = new Date().toLocaleTimeString();
@@ -77,10 +116,14 @@ function renderList(){
     row.className = 'deviceRow' + (e.active ? ' active' : '');
     const info = document.createElement('div');
     info.className = 'devInfo';
+
+    let stateTxt = e.online ? 'online' : 'offline';
+    if (e.reconnecting) stateTxt = 'reconnecting...';
+
     info.innerHTML =
       `<strong>${e.device.name||e.device.id}</strong>
        <div style="font-size:12px;color:#555">
-       ${e.online?'online':'offline'} |
+       ${stateTxt} |
        last R=${e.lastColor[0]} G=${e.lastColor[1]} B=${e.lastColor[2]}</div>`;
     const controls = document.createElement('div');
 
@@ -117,7 +160,8 @@ async function scanAndAdd(){
 
     const entry = {
       device:dev, server:null, colorChar:null, ledChar:null,
-      selected:false, active:false, lastColor:[0,0,0], online:false
+      selected:false, active:false, lastColor:[0,0,0],
+      online:false, reconnecting:false
     };
     devices.push(entry);
     renderList();
@@ -129,12 +173,16 @@ async function scanAndAdd(){
 
 async function connectEntry(entry){
   try {
+    entry.reconnecting = false;
+    renderList();
+
     log('Connecting '+(entry.device.name||entry.device.id));
     entry.server = await entry.device.gatt.connect();
 
     entry.device.addEventListener('gattserverdisconnected', ()=>{
       entry.online=false;
-      log('Disconnected '+(entry.device.name||entry.device.id));
+      entry.reconnecting = true;
+      log('Disconnected '+(entry.device.name||entry.device.id)+' (reconnecting...)');
       renderList();
       setTimeout(()=>connectEntry(entry).catch(()=>{}), 1000);
     });
@@ -150,6 +198,7 @@ async function connectEntry(entry){
         const r=d.getUint8(0), g=d.getUint8(1), b=d.getUint8(2);
         entry.lastColor = [r,g,b];
         entry.online = true;
+        entry.reconnecting = false;
         if(entry === activeDevice) setSlidersFromEntry(entry);
         renderList();
       }
@@ -162,11 +211,13 @@ async function connectEntry(entry){
     }catch(e){}
 
     entry.online=true;
+    entry.reconnecting = false;
     log('Connected '+(entry.device.name||entry.device.id));
     renderList();
 
   } catch(err){
     entry.online=false;
+    entry.reconnecting = false;
     log('Connect fail '+err);
     renderList();
   }
@@ -174,7 +225,10 @@ async function connectEntry(entry){
 
 async function disconnectEntry(entry){
   try {
-    entry.device.gatt.disconnect();
+    entry.reconnecting = false;
+    if (entry.device.gatt.connected){
+      entry.device.gatt.disconnect();
+    }
     entry.online=false;
     log('Force disconnect '+(entry.device.name||entry.device.id));
     renderList();
@@ -196,35 +250,35 @@ function setSlidersFromEntry(entry){
   blueSlider.value = entry.lastColor[2];
 }
 
-async function sendToActive(){
-  if(!activeDevice||!activeDevice.online||!activeDevice.colorChar) return;
-
-  const r=+redSlider.value, g=+greenSlider.value, b=+blueSlider.value;
+async function sendColorToTargets(r,g,b, targets){
+  if(!targets || targets.length===0) return;
   const data = new Uint8Array([r,g,b]);
-
-  try{
-    await activeDevice.colorChar.writeValue(data);
-    activeDevice.lastColor=[r,g,b];
-    renderList();
-  }catch(err){ log('Write active err '+err); }
-}
-
-async function realtimeSyncToSelected(){
-  const r=+redSlider.value, g=+greenSlider.value, b=+blueSlider.value;
-  const data = new Uint8Array([r,g,b]);
-
-  const targets = devices.filter(d=>d.selected && d.online && d.colorChar);
-  if(targets.length===0){ log("No selected online devices"); return; }
-
   for(const e of targets){
+    if(!e.online || !e.colorChar) continue;
     try{
       await e.colorChar.writeValue(data);
       e.lastColor=[r,g,b];
     }catch(err){
-      log("Sync fail "+(e.device.name||e.device.id));
+      log("Write fail "+(e.device.name||e.device.id));
     }
   }
   renderList();
+}
+
+async function sendToActive(){
+  if(!activeDevice||!activeDevice.online||!activeDevice.colorChar) return;
+  const r=+redSlider.value, g=+greenSlider.value, b=+blueSlider.value;
+  await sendColorToTargets(r,g,b,[activeDevice]);
+}
+
+async function realtimeSyncToSelected(){
+  const r=+redSlider.value, g=+greenSlider.value, b=+blueSlider.value;
+  const targets = devices.filter(d=>d.selected && d.online && d.colorChar);
+  if(targets.length===0){
+    log("No selected online devices");
+    return;
+  }
+  await sendColorToTargets(r,g,b,targets);
 }
 
 btnSync.onclick = ()=>{
@@ -243,26 +297,29 @@ btnSync.onclick = ()=>{
 async function setLedStateOnSelected(state){
   const targets = devices.filter(d=>d.selected && d.online && d.ledChar);
   const data = new Uint8Array([state?1:0]);
+  if(targets.length===0){
+    log("No selected online devices for LED");
+    return;
+  }
   for(const e of targets){
     try{
       await e.ledChar.writeValue(data);
       log(`LED ${state?'ON':'OFF'} -> ${e.device.name||e.device.id}`);
-    }catch(err){}
+    }catch(err){
+      log("LED fail "+(e.device.name||e.device.id));
+    }
   }
 }
 
-// SLIDERS
-let throttleTimer=null;
+// sliders
 function sliderChanged(){
   if(throttleTimer) clearTimeout(throttleTimer);
   throttleTimer=setTimeout(()=>{
-
     if(syncMode){
       realtimeSyncToSelected();
     } else {
       sendToActive();
     }
-
     throttleTimer=null;
   },50);
 }
@@ -271,6 +328,70 @@ redSlider.oninput = sliderChanged;
 greenSlider.oninput = sliderChanged;
 blueSlider.oninput = sliderChanged;
 
+// presets
+function applyPreset(r,g,b){
+  redSlider.value = r;
+  greenSlider.value = g;
+  blueSlider.value = b;
+  sliderChanged();
+}
+
+btnPresetRed.onclick   = ()=>applyPreset(255,0,0);
+btnPresetGreen.onclick = ()=>applyPreset(0,255,0);
+btnPresetBlue.onclick  = ()=>applyPreset(0,0,255);
+btnPresetWhite.onclick = ()=>applyPreset(255,255,255);
+btnPresetWarm.onclick  = ()=>applyPreset(255,180,80);
+btnPresetOff.onclick   = ()=>applyPreset(0,0,0);
+
+// group buttons
+btnSelectAll.onclick = ()=>{
+  devices.forEach(d=>{ if(d.online) d.selected=true; });
+  renderList();
+};
+btnClearSel.onclick = ()=>{
+  devices.forEach(d=>d.selected=false);
+  renderList();
+};
+
+// animation
+function stopAnimation(){
+  if(animTimer){
+    clearInterval(animTimer);
+    animTimer=null;
+  }
+  animMode=null;
+  log("Animation stopped");
+}
+
+function startBreath(){
+  stopAnimation();
+  animMode = 'breath';
+  animPhase = 0;
+  log("Breath animation started");
+  animTimer = setInterval(async ()=>{
+    if(animMode!=='breath') return;
+    animPhase += 0.12;
+    const baseR = +redSlider.value;
+    const baseG = +greenSlider.value;
+    const baseB = +blueSlider.value;
+    const f = (Math.sin(animPhase)+1)/2; // 0..1
+    const r = Math.round(baseR*f);
+    const g = Math.round(baseG*f);
+    const b = Math.round(baseB*f);
+
+    if(syncMode){
+      const targets = devices.filter(d=>d.selected && d.online && d.colorChar);
+      await sendColorToTargets(r,g,b,targets);
+    } else if(activeDevice){
+      await sendColorToTargets(r,g,b,[activeDevice]);
+    }
+  }, 80);
+}
+
+btnAnimBreath.onclick = startBreath;
+btnAnimStop.onclick = stopAnimation;
+
+// events
 btnScan.onclick = scanAndAdd;
 btnLedOn.onclick = ()=>setLedStateOnSelected(1);
 btnLedOff.onclick = ()=>setLedStateOnSelected(0);

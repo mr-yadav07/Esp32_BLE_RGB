@@ -1,44 +1,348 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>ESP32 Hybrid Control</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>ESP32 BLE Mobile Control</title>
+<style>
+  body{font-family:sans-serif;margin:0;display:flex;flex-direction:column;height:100vh}
+  #deviceList{flex:1;overflow:auto;padding:8px;background:#f7f7f7}
+  .deviceRow{display:flex;align-items:center;justify-content:space-between;padding:8px;margin:6px 0;border-radius:6px;background:#fff;border:1px solid #ddd}
+  .devInfo{flex:1;margin-right:8px}
+  .active{box-shadow:0 0 0 3px rgba(0,128,255,0.12)}
+  #controls{padding:10px;background:#ededed;border-top:1px solid #ccc}
+  #sliders{display:flex;flex-direction:column;gap:8px;margin-bottom:8px}
+  .sliderRow{display:flex;align-items:center;gap:8px}
+  .sliderRow label{width:30px}
+  input[type=range]{flex:1}
+  button{width:100%;padding:10px;margin:4px 0;border:none;border-radius:6px;background:#1976d2;color:#fff}
+  .smallBtn{padding:6px;font-size:12px}
+  #status{height:90px;overflow:auto;background:#111;color:#0f0;font-family:monospace;font-size:12px;padding:6px;border-radius:6px;margin-top:6px}
+</style>
 </head>
 <body>
-
-<button onclick="send(0x03)">ON</button>
-<button onclick="send(0x09)">OFF</button>
-<button onclick="send(0x05)">OK</button><br><br>
-
-<button onclick="send(0x0D)">1</button>
-<button onclick="send(0x19)">2</button>
-<button onclick="send(0x1B)">3</button>
-<button onclick="send(0x01)">4</button>
-<button onclick="send(0x11)">5</button>
-<button onclick="send(0x15)">6</button>
-
+  <div id="deviceList"></div>
+  <div id="controls">
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <button id="btnScan">Scan</button>
+      <button id="btnSync">Sync OFF</button>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:4px">
+      <button id="btnSelectAll" class="smallBtn">Select All Online</button>
+      <button id="btnClearSel" class="smallBtn">Clear Selection</button>
+    </div>
+    <div id="sliders">
+      <div class="sliderRow"><label>R</label><input id="redSlider" type="range" min="0" max="255"></div>
+      <div class="sliderRow"><label>G</label><input id="greenSlider" type="range" min="0" max="255"></div>
+      <div class="sliderRow"><label>B</label><input id="blueSlider" type="range" min="0" max="255"></div>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px">
+      <button id="presetRed"   class="smallBtn" style="flex:1;background:#b71c1c">Red</button>
+      <button id="presetGreen" class="smallBtn" style="flex:1;background:#1b5e20">Green</button>
+      <button id="presetBlue"  class="smallBtn" style="flex:1;background:#0d47a1">Blue</button>
+      <button id="presetWhite" class="smallBtn" style="flex:1;background:#9e9e9e">White</button>
+      <button id="presetWarm"  class="smallBtn" style="flex:1;background:#ff8f00">Warm</button>
+      <button id="presetOff"   class="smallBtn" style="flex:1;background:#424242">Off</button>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:6px">
+      <button id="btnAnimBreath" class="smallBtn" style="flex:1;background:#6a1b9a">Breath</button>
+      <button id="btnAnimStop"   class="smallBtn" style="flex:1;background:#455a64">Stop Anim</button>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button id="btnLedOn" style="flex:1;background:#2e7d32">LED ON</button>
+      <button id="btnLedOff" style="flex:1;background:#c62828">LED OFF</button>
+    </div>
+    <div id="status"></div>
+  </div>
 <script>
-let device, writer;
-
-async function connect() {
-  device = await navigator.bluetooth.requestDevice({
-    filters: [{ name: 'ESP32-HYBRID' }],
-    optionalServices: ['00001101-0000-1000-8000-00805f9b34fb']
-  });
-
-  const server = await device.gatt.connect();
-  const service = await server.getPrimaryService('00001101-0000-1000-8000-00805f9b34fb');
-  const characteristic = await service.getCharacteristic('00001101-0000-1000-8000-00805f9b34fb');
-  writer = characteristic;
+const SERVICE = '12345678-1234-1234-1234-1234567890ab';
+const COLOR_UUID = '87654321-4321-4321-4321-abcdefabcdef';
+const LED_UUID   = 'abcdefab-cdef-cdef-cdef-1234567890ab';
+let devices = []; // {device, server, colorChar, ledChar, selected, active, lastColor, online, reconnecting}
+let activeDevice = null;
+let syncMode = false;
+const deviceListDiv = document.getElementById('deviceList');
+const statusDiv = document.getElementById('status');
+const btnScan = document.getElementById('btnScan');
+const btnSync = document.getElementById('btnSync');
+const btnSelectAll = document.getElementById('btnSelectAll');
+const btnClearSel = document.getElementById('btnClearSel');
+const redSlider = document.getElementById('redSlider');
+const greenSlider = document.getElementById('greenSlider');
+const blueSlider = document.getElementById('blueSlider');
+const btnLedOn = document.getElementById('btnLedOn');
+const btnLedOff = document.getElementById('btnLedOff');
+const btnPresetRed   = document.getElementById('presetRed');
+const btnPresetGreen = document.getElementById('presetGreen');
+const btnPresetBlue  = document.getElementById('presetBlue');
+const btnPresetWhite = document.getElementById('presetWhite');
+const btnPresetWarm  = document.getElementById('presetWarm');
+const btnPresetOff   = document.getElementById('presetOff');
+const btnAnimBreath = document.getElementById('btnAnimBreath');
+const btnAnimStop   = document.getElementById('btnAnimStop');
+let throttleTimer = null;
+// animation state
+let animTimer = null;
+let animMode = null;
+let animPhase = 0;
+function log(msg){
+  const t = new Date().toLocaleTimeString();
+  statusDiv.textContent += `[${t}] ${msg}\n`;
+  statusDiv.scrollTop = statusDiv.scrollHeight;
 }
-
-function send(cmd) {
-  if (!writer) return;
-  writer.writeValue(Uint8Array.of(cmd));
+function findEntryByDevice(dev){
+  return devices.find(e=>e.device.id === dev.id);
 }
+function renderList(){
+  deviceListDiv.innerHTML = '';
+  devices.forEach((e)=>{
+    const row = document.createElement('div');
+    row.className = 'deviceRow' + (e.active ? ' active' : '');
+    const info = document.createElement('div');
+    info.className = 'devInfo';
+    let stateTxt = e.online ? 'online' : 'offline';
+    if (e.reconnecting) stateTxt = 'reconnecting...';
+    info.innerHTML =
+      `<strong>${e.device.name||e.device.id}</strong>
+       <div style="font-size:12px;color:#555">
+       ${stateTxt} |
+       last R=${e.lastColor[0]} G=${e.lastColor[1]} B=${e.lastColor[2]}</div>`;
+    const controls = document.createElement('div');
+    const sel = document.createElement('input');
+    sel.type='checkbox'; sel.checked = !!e.selected;
+    sel.onclick = (ev)=>{ e.selected = ev.target.checked; };
+    const act = document.createElement('button');
+    act.textContent = 'Edit';
+    act.onclick = ()=>{ setActive(e); };
+    const conn = document.createElement('button');
+    conn.textContent = e.online ? 'Disconnect':'Connect';
+    conn.onclick = ()=>{ e.online ? disconnectEntry(e) : connectEntry(e); };
+    controls.appendChild(sel);
+    controls.appendChild(act);
+    controls.appendChild(conn);
+    row.appendChild(info);
+    row.appendChild(controls);
+    deviceListDiv.appendChild(row);
+  });
+}
+async function scanAndAdd(){
+  try {
+    const dev = await navigator.bluetooth.requestDevice({
+      acceptAllDevices:true,
+      optionalServices:[SERVICE]
+    });
+    if(findEntryByDevice(dev)){ log('Already added'); return; }
+    const entry = {
+      device:dev, server:null, colorChar:null, ledChar:null,
+      selected:false, active:false, lastColor:[0,0,0],
+      online:false, reconnecting:false
+    };
+    devices.push(entry);
+    renderList();
+    log('Added '+(dev.name||dev.id));
+    await connectEntry(entry);
+  } catch(err){ log('Scan error: '+err); }
+}
+async function connectEntry(entry){
+  try {
+    entry.reconnecting = false;
+    renderList();
+    log('Connecting '+(entry.device.name||entry.device.id));
+    entry.server = await entry.device.gatt.connect();
+    entry.device.addEventListener('gattserverdisconnected', ()=>{
+      entry.online=false;
+      entry.reconnecting = true;
+      log('Disconnected '+(entry.device.name||entry.device.id)+' (reconnecting...)');
+      renderList();
+      setTimeout(()=>connectEntry(entry).catch(()=>{}), 1000);
+    });
+    const svc = await entry.server.getPrimaryService(SERVICE);
+    entry.colorChar = await svc.getCharacteristic(COLOR_UUID);
+    entry.ledChar   = await svc.getCharacteristic(LED_UUID);
+    await entry.colorChar.startNotifications();
+    entry.colorChar.addEventListener('characteristicvaluechanged', (ev)=>{
+      const d = ev.target.value;
+      if (d.byteLength>=3){
+        const r=d.getUint8(0), g=d.getUint8(1), b=d.getUint8(2);
+        entry.lastColor = [r,g,b];
+        entry.online = true;
+        entry.reconnecting = false;
+        if(entry === activeDevice) setSlidersFromEntry(entry);
+        renderList();
+      }
+    });
+    try{
+      const v = await entry.colorChar.readValue();
+      if (v.byteLength>=3)
+        entry.lastColor = [v.getUint8(0),v.getUint8(1),v.getUint8(2)];
+    }catch(e){}
+    entry.online=true;
+    entry.reconnecting = false;
+    log('Connected '+(entry.device.name||entry.device.id));
+    renderList();
+  } catch(err){
+    entry.online=false;
+    entry.reconnecting = false;
+    log('Connect fail '+err);
+    renderList();
+  }
+}
+async function disconnectEntry(entry){
+  try {
+    entry.reconnecting = false;
+    if (entry.device.gatt.connected){
+      entry.device.gatt.disconnect();
+    }
+    entry.online=false;
+    log('Force disconnect '+(entry.device.name||entry.device.id));
+    renderList();
+  } catch(e){ log('Disconnect error '+e); }
+}
+function setActive(entry){
+  devices.forEach(e=>e.active=false);
+  entry.active=true;
+  activeDevice = entry;
+  setSlidersFromEntry(entry);
+  renderList();
+  log('Editing '+(entry.device.name||entry.device.id));
+}
+function setSlidersFromEntry(entry){
+  redSlider.value = entry.lastColor[0];
+  greenSlider.value = entry.lastColor[1];
+  blueSlider.value = entry.lastColor[2];
+}
+async function sendColorToTargets(r,g,b, targets){
+  if(!targets || targets.length===0) return;
+  const data = new Uint8Array([r,g,b]);
+  for(const e of targets){
+    if(!e.online || !e.colorChar) continue;
+    try{
+      await e.colorChar.writeValue(data);
+      e.lastColor=[r,g,b];
+    }catch(err){
+      log("Write fail "+(e.device.name||e.device.id));
+    }
+  }
+  renderList();
+}
+async function sendToActive(){
+  if(!activeDevice||!activeDevice.online||!activeDevice.colorChar) return;
+  const r=+redSlider.value, g=+greenSlider.value, b=+blueSlider.value;
+  await sendColorToTargets(r,g,b,[activeDevice]);
+}
+async function realtimeSyncToSelected(){
+  const r=+redSlider.value, g=+greenSlider.value, b=+blueSlider.value;
+  const targets = devices.filter(d=>d.selected && d.online && d.colorChar);
+  if(targets.length===0){
+    log("No selected online devices");
+    return;
+  }
+  await sendColorToTargets(r,g,b,targets);
+}
+btnSync.onclick = ()=>{
+  syncMode = !syncMode;
+  if(syncMode){
+    btnSync.style.background="#008000";
+    btnSync.textContent="Sync ON";
+    log("Sync ENABLED");
+  } else {
+    btnSync.style.background="#1976d2";
+    btnSync.textContent="Sync OFF";
+    log("Sync DISABLED");
+  }
+};
+async function setLedStateOnSelected(state){
+  const targets = devices.filter(d=>d.selected && d.online && d.ledChar);
+  const data = new Uint8Array([state?1:0]);
+  if(targets.length===0){
+    log("No selected online devices for LED");
+    return;
+  }
+  for(const e of targets){
+    try{
+      await e.ledChar.writeValue(data);
+      log(`LED ${state?'ON':'OFF'} -> ${e.device.name||e.device.id}`);
+    }catch(err){
+      log("LED fail "+(e.device.name||e.device.id));
+    }
+  }
+}
+// sliders
+function sliderChanged(){
+  if(throttleTimer) clearTimeout(throttleTimer);
+  throttleTimer=setTimeout(()=>{
+    if(syncMode){
+      realtimeSyncToSelected();
+    } else {
+      sendToActive();
+    }
+    throttleTimer=null;
+  },50);
+}
+redSlider.oninput = sliderChanged;
+greenSlider.oninput = sliderChanged;
+blueSlider.oninput = sliderChanged;
+// presets
+function applyPreset(r,g,b){
+  redSlider.value = r;
+  greenSlider.value = g;
+  blueSlider.value = b;
+  sliderChanged();
+}
+btnPresetRed.onclick   = ()=>applyPreset(255,0,0);
+btnPresetGreen.onclick = ()=>applyPreset(0,255,0);
+btnPresetBlue.onclick  = ()=>applyPreset(0,0,255);
+btnPresetWhite.onclick = ()=>applyPreset(255,255,255);
+btnPresetWarm.onclick  = ()=>applyPreset(255,180,80);
+btnPresetOff.onclick   = ()=>applyPreset(0,0,0);
+// group buttons
+btnSelectAll.onclick = ()=>{
+  devices.forEach(d=>{ if(d.online) d.selected=true; });
+  renderList();
+};
+btnClearSel.onclick = ()=>{
+  devices.forEach(d=>d.selected=false);
+  renderList();
+};
+// animation
+function stopAnimation(){
+  if(animTimer){
+    clearInterval(animTimer);
+    animTimer=null;
+  }
+  animMode=null;
+  log("Animation stopped");
+}
+function startBreath(){
+  stopAnimation();
+  animMode = 'breath';
+  animPhase = 0;
+  log("Breath animation started");
+  animTimer = setInterval(async ()=>{
+    if(animMode!=='breath') return;
+    animPhase += 0.12;
+    const baseR = +redSlider.value;
+    const baseG = +greenSlider.value;
+    const baseB = +blueSlider.value;
+    const f = (Math.sin(animPhase)+1)/2; // 0..1
+    const r = Math.round(baseR*f);
+    const g = Math.round(baseG*f);
+    const b = Math.round(baseB*f);
+    if(syncMode){
+      const targets = devices.filter(d=>d.selected && d.online && d.colorChar);
+      await sendColorToTargets(r,g,b,targets);
+    } else if(activeDevice){
+      await sendColorToTargets(r,g,b,[activeDevice]);
+    }
+  }, 80);
+}
+btnAnimBreath.onclick = startBreath;
+btnAnimStop.onclick = stopAnimation;
+// events
+btnScan.onclick = scanAndAdd;
+btnLedOn.onclick = ()=>setLedStateOnSelected(1);
+btnLedOff.onclick = ()=>setLedStateOnSelected(0);
+renderList();
+log('App ready');
 </script>
-
-<button onclick="connect()">Connect Bluetooth</button>
-
 </body>
 </html>
